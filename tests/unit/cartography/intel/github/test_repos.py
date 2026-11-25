@@ -1222,6 +1222,37 @@ def test_transform_skips_null_repository_entries():
     assert result["repos"][0]["id"] == repo_with_collab_counts["url"]
 
 
+def test_transform_persists_database_id():
+    """Verify repository transform maps databaseId to database_id as integer."""
+    from copy import deepcopy
+
+    repo_data = deepcopy(GET_REPOS[0])
+    repo_data["databaseId"] = 987654321
+
+    result = transform(
+        [repo_data],
+        {repo_data["url"]: []},
+        {repo_data["url"]: []},
+    )
+
+    assert len(result["repos"]) == 1
+    assert result["repos"][0]["database_id"] == 987654321
+
+
+def test_transform_database_id_none_when_missing():
+    """Verify repository transform sets database_id to None when databaseId is absent."""
+    repo_with_collab_counts = GET_REPOS[0]
+
+    result = transform(
+        [repo_with_collab_counts],
+        {repo_with_collab_counts["url"]: []},
+        {repo_with_collab_counts["url"]: []},
+    )
+
+    assert len(result["repos"]) == 1
+    assert result["repos"][0]["database_id"] is None
+
+
 def test_transform_includes_branch_protection_rules():
     """
     Test that the transform function includes branch protection rules in the output.

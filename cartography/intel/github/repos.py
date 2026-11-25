@@ -102,6 +102,7 @@ GITHUB_ORG_REPOS_PAGINATED_GRAPHQL = """
                 nodes{
                     name
                     nameWithOwner
+                    databaseId
                     primaryLanguage{
                         name
                     }
@@ -1442,10 +1443,16 @@ def _transform_repo_objects(input_repo_object: Dict, out_repo_list: List[Dict]) 
     parent = input_repo_object.get("parent")
     # Merged in from the REST API by sync(); absent when not visible to the credential.
     security_and_analysis = input_repo_object.get("securityAndAnalysis")
+    database_id = (
+        int(input_repo_object["databaseId"])
+        if input_repo_object.get("databaseId") is not None
+        else None
+    )
 
     out_repo_list.append(
         {
             "id": input_repo_object["url"],
+            "database_id": database_id,
             "createdat": input_repo_object["createdAt"],
             "name": input_repo_object["name"],
             "fullname": input_repo_object["nameWithOwner"],

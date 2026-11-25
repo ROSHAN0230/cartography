@@ -1,12 +1,17 @@
 import json
 import logging
+from collections import defaultdict
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 from typing import Any
 from typing import Dict
 from typing import List
+from typing import Optional
+from typing import Tuple
 
 import boto3
+import dateutil.parser
 import neo4j
 from botocore.exceptions import ClientError
 from botocore.exceptions import ConnectionClosedError
@@ -26,6 +31,9 @@ from cartography.models.aws.cloudtrail.management_events import (
 )
 from cartography.models.aws.cloudtrail.management_events import (
     GitHubRepoAssumeRoleWithWebIdentityMatchLink,
+)
+from cartography.models.aws.cloudtrail.management_events import (
+    GitHubRepoImmutableAssumeRoleWithWebIdentityMatchLink,
 )
 from cartography.util import aws_handle_regions
 from cartography.util import timeit
@@ -440,8 +448,6 @@ def transform_web_identity_role_events_to_role_assumptions(
 
             # Only process GitHub Actions events
             if "token.actions.githubusercontent.com" in identity_provider:
-                # Extract GitHub repo fullname from the OIDC subject in userName, e.g.
-                # "repo:{organization}/{repository}:{context}" or its immutable form with "@{id}" suffixes
                 user_name = user_identity.get("userName", "")
                 if not user_name:
                     logger.debug(
@@ -449,14 +455,24 @@ def transform_web_identity_role_events_to_role_assumptions(
                     )
                     continue
 
-                github_repo = _extract_github_repo_from_username(user_name)
-                if not github_repo:
+                parsed_subject = parse_github_oidc_subject(user_name)
+                if not parsed_subject:
                     logger.debug(
-                        f"Skipping GitHub WebIdentity event with malformed subject: {event.get('EventId', 'unknown')}"
+                        f"Unable to parse GitHub OIDC subject claim from userName '{user_name}' in event: {event.get('EventId', 'unknown')}"
                     )
                     continue
 
-                key = (github_repo, destination_principal)
+                github_repo, repo_database_id, owner_database_id = parsed_subject
+
+                key: Tuple[Any, ...]
+                if repo_database_id is not None:
+                    key = (
+                        "immutable",
+                        str(repo_database_id),
+                        destination_principal,
+                    )
+                else:
+                    key = ("legacy", github_repo, destination_principal)
 
                 if key in github_aggregated:
                     github_aggregated[key]["times_used"] += 1
@@ -473,9 +489,20 @@ def transform_web_identity_role_events_to_role_assumptions(
                             ] = event_time
                         if existing_last is None or event_time > existing_last:
                             github_aggregated[key]["last_used"] = event_time
+
+                    if owner_database_id is not None:
+                        owner_ids = github_aggregated[key]["source_owner_database_ids"]
+                        if owner_database_id not in owner_ids:
+                            owner_ids.append(owner_database_id)
+                            owner_ids.sort()
                 else:
+                    initial_owner_ids = (
+                        [owner_database_id] if owner_database_id is not None else []
+                    )
                     github_aggregated[key] = {
                         "source_repo_fullname": github_repo,
+                        "source_repo_database_id": repo_database_id,
+                        "source_owner_database_ids": initial_owner_ids,
                         "destination_principal_arn": destination_principal,
                         "times_used": 1,
                         "first_seen_in_time_window": event_time,
@@ -566,6 +593,201 @@ def load_saml_role_assumptions(
     )
 
 
+def _parse_to_utc_datetime(ts: Any) -> Optional[datetime]:
+    """
+    Parse a timestamp (datetime object or ISO string) into a timezone-aware UTC datetime.
+    Returns None if ts is None, empty, or unparseable.
+    """
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=timezone.utc)
+        return ts.astimezone(timezone.utc)
+    if isinstance(ts, str):
+        cleaned = ts.strip()
+        if not cleaned:
+            return None
+        try:
+            parsed = dateutil.parser.parse(cleaned)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return None
+
+
+def _earliest_timestamp(ts1: Any, ts2: Any) -> Any:
+    """
+    Return the chronologically earlier timestamp between ts1 and ts2,
+    handling None, datetime objects, and ISO timestamp strings.
+    """
+    if ts1 is None:
+        return ts2
+    if ts2 is None:
+        return ts1
+    dt1 = _parse_to_utc_datetime(ts1)
+    dt2 = _parse_to_utc_datetime(ts2)
+    if dt1 is None:
+        return ts2
+    if dt2 is None:
+        return ts1
+    return ts1 if dt1 <= dt2 else ts2
+
+
+def _latest_timestamp(ts1: Any, ts2: Any) -> Any:
+    """
+    Return the chronologically later timestamp between ts1 and ts2,
+    handling None, datetime objects, and ISO timestamp strings.
+    """
+    if ts1 is None:
+        return ts2
+    if ts2 is None:
+        return ts1
+    dt1 = _parse_to_utc_datetime(ts1)
+    dt2 = _parse_to_utc_datetime(ts2)
+    if dt1 is None:
+        return ts2
+    if dt2 is None:
+        return ts1
+    return ts1 if dt1 >= dt2 else ts2
+
+
+def resolve_and_validate_legacy_web_identity_role_assumptions(
+    neo4j_session: neo4j.Session,
+    legacy_role_assumptions: List[Dict[str, Any]],
+) -> List[Tuple[Dict[str, Any], Optional[int]]]:
+    """
+    Validate legacy WebIdentity role assumptions against GitHubRepository nodes in Neo4j.
+
+    Fails closed when:
+    - Multiple GitHubRepository nodes exist with the same fullname (ambiguous).
+    - Repository creation timestamp (createdat) is missing or unparseable.
+    - Earliest CloudTrail event timestamp (first_seen_in_time_window) is missing or unparseable.
+    - The earliest event occurred before repository creation (createdat > first_seen_in_time_window),
+      which indicates historical events from a predecessor deleted repository.
+
+    Returns a list of tuples: (validated_legacy_assumption_dict, resolved_repository_database_id).
+    The resolved repository database ID is None if the node has no database_id in the graph.
+    """
+    if not legacy_role_assumptions:
+        return []
+
+    fullnames = list(
+        {
+            a["source_repo_fullname"]
+            for a in legacy_role_assumptions
+            if a.get("source_repo_fullname")
+        }
+    )
+    if not fullnames:
+        return []
+
+    query = """
+    MATCH (from:GitHubRepository)
+    WHERE from.fullname IN $fullnames
+    RETURN from.fullname AS fullname, from.createdat AS createdat, from.database_id AS database_id
+    """
+    records = neo4j_session.run(query, fullnames=fullnames).data()
+
+    nodes_by_fullname: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for r in records:
+        nodes_by_fullname[r["fullname"]].append(r)
+
+    validated_assumptions: List[Tuple[Dict[str, Any], Optional[int]]] = []
+    for item in legacy_role_assumptions:
+        fullname = item.get("source_repo_fullname")
+        if not fullname:
+            continue
+        nodes = nodes_by_fullname.get(fullname, [])
+
+        # Uniqueness check: exactly one repository node must exist
+        if len(nodes) != 1:
+            logger.warning(
+                "Legacy GitHub repository match for %s is ambiguous or missing (%d nodes found). Failing closed.",
+                fullname,
+                len(nodes),
+            )
+            continue
+
+        node = nodes[0]
+        raw_createdat = node.get("createdat")
+        raw_first_seen = item.get("first_seen_in_time_window")
+
+        # Critical correction B: Fail-closed when lifecycle evidence is missing
+        if raw_createdat is None or raw_first_seen is None:
+            logger.warning(
+                "Missing lifecycle timestamp evidence for %s (createdat=%s, first_seen=%s). Failing closed.",
+                fullname,
+                raw_createdat,
+                raw_first_seen,
+            )
+            continue
+
+        # Critical correction C: Normalize both timestamps to timezone-aware UTC datetimes
+        repo_created_dt = _parse_to_utc_datetime(raw_createdat)
+        event_first_seen_dt = _parse_to_utc_datetime(raw_first_seen)
+
+        if repo_created_dt is None or event_first_seen_dt is None:
+            logger.warning(
+                "Unable to parse lifecycle timestamps for %s (createdat=%s, first_seen=%s). Failing closed.",
+                fullname,
+                raw_createdat,
+                raw_first_seen,
+            )
+            continue
+
+        # Critical correction A: Lifecycle protection - earliest event in aggregate must be after repository creation
+        if repo_created_dt > event_first_seen_dt:
+            logger.warning(
+                "Legacy event for %s occurred before repository creation (createdat=%s, first_seen=%s). "
+                "Rejecting aggregate to prevent misattribution to replacement repository.",
+                fullname,
+                raw_createdat,
+                raw_first_seen,
+            )
+            continue
+
+        raw_db_id = node.get("database_id")
+        resolved_db_id: Optional[int] = None
+        if raw_db_id is not None:
+            try:
+                resolved_db_id = int(raw_db_id)
+            except (ValueError, TypeError):
+                resolved_db_id = None
+
+        validated_assumptions.append((dict(item), resolved_db_id))
+
+    return validated_assumptions
+
+
+def load_legacy_web_identity_role_assumptions(
+    neo4j_session: neo4j.Session,
+    legacy_role_assumptions: List[Dict[str, Any]],
+    current_aws_account_id: str,
+    aws_update_tag: int,
+) -> None:
+    """
+    Load legacy WebIdentity role assumptions using safe fullname matching.
+    """
+    validated = resolve_and_validate_legacy_web_identity_role_assumptions(
+        neo4j_session,
+        legacy_role_assumptions,
+    )
+    safe_legacy_assumptions = [item for item, _ in validated]
+    if safe_legacy_assumptions:
+        legacy_matchlink_schema = GitHubRepoAssumeRoleWithWebIdentityMatchLink()
+        load_matchlinks(
+            neo4j_session,
+            legacy_matchlink_schema,
+            safe_legacy_assumptions,
+            lastupdated=aws_update_tag,
+            _sub_resource_label="AWSAccount",
+            _sub_resource_id=current_aws_account_id,
+        )
+
+
 @timeit
 def load_web_identity_role_assumptions(
     neo4j_session: neo4j.Session,
@@ -574,34 +796,129 @@ def load_web_identity_role_assumptions(
     aws_update_tag: int,
 ) -> None:
     """
-    Load aggregated WebIdentity role assumption relationships into Neo4j using MatchLink pattern.
+    Load aggregated WebIdentity role assumption relationships into Neo4j.
 
     Creates direct ASSUMED_ROLE_WITH_WEB_IDENTITY relationships with aggregated properties:
     (GitHubRepository)-[:ASSUMED_ROLE_WITH_WEB_IDENTITY {lastupdated, times_used, first_seen_in_time_window, last_used}]->(AWSRole)
 
-    Assumes that both source principals and destination roles already exist in the graph.
-
-    :type neo4j_session: neo4j.Session
-    :param neo4j_session: The Neo4j session to use for database operations
-    :type aggregated_role_assumptions: List[Dict[str, Any]]
-    :param aggregated_role_assumptions: List of aggregated WebIdentity role assumption relationships from transform function
-    :type current_aws_account_id: str
-    :param current_aws_account_id: The AWS account ID being synced
-    :type aws_update_tag: int
-    :param aws_update_tag: Timestamp tag for tracking data freshness
-    :rtype: None
+    - Immutable events (with source_repo_database_id) match GitHubRepository nodes by database_id.
+    - Legacy events (without source_repo_database_id) are validated against GitHubRepository nodes in Neo4j.
+      When a legacy event matches a repository node with a known database_id, it is coalesced into the
+      immutable assumption row for (repository_database_id, destination_principal_arn) or promoted to the
+      immutable MatchLink path if no immutable event exists.
+    - Legacy events whose repository has no database_id in Neo4j remain on the legacy fullname MatchLink path.
+    - Ensures each MatchLink schema is loaded at most once per sync, preventing relationship property overwrites.
     """
-    # Use MatchLink to create relationships between existing nodes
-    matchlink_schema = GitHubRepoAssumeRoleWithWebIdentityMatchLink()
+    immutable_assumptions = [
+        a
+        for a in aggregated_role_assumptions
+        if a.get("source_repo_database_id") is not None
+    ]
+    legacy_assumptions = [
+        a
+        for a in aggregated_role_assumptions
+        if a.get("source_repo_database_id") is None
+    ]
 
-    load_matchlinks(
-        neo4j_session,
-        matchlink_schema,
-        aggregated_role_assumptions,
-        lastupdated=aws_update_tag,
-        _sub_resource_label="AWSAccount",
-        _sub_resource_id=current_aws_account_id,
-    )
+    coalesced_immutable: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for item in immutable_assumptions:
+        db_id = int(item["source_repo_database_id"])
+        role_arn = item["destination_principal_arn"]
+        entry = dict(item)
+        if (
+            "source_owner_database_ids" not in entry
+            or entry["source_owner_database_ids"] is None
+        ):
+            entry["source_owner_database_ids"] = []
+        else:
+            entry["source_owner_database_ids"] = list(
+                entry["source_owner_database_ids"]
+            )
+        coalesced_immutable[(db_id, role_arn)] = entry
+
+    remaining_legacy_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    if legacy_assumptions:
+        validated_legacy = resolve_and_validate_legacy_web_identity_role_assumptions(
+            neo4j_session,
+            legacy_assumptions,
+        )
+        for legacy_item, resolved_db_id in validated_legacy:
+            role_arn = legacy_item["destination_principal_arn"]
+            if resolved_db_id is not None:
+                key = (resolved_db_id, role_arn)
+                if key in coalesced_immutable:
+                    target = coalesced_immutable[key]
+                    target["times_used"] += legacy_item.get("times_used", 1)
+                    target["first_seen_in_time_window"] = _earliest_timestamp(
+                        target.get("first_seen_in_time_window"),
+                        legacy_item.get("first_seen_in_time_window"),
+                    )
+                    target["last_used"] = _latest_timestamp(
+                        target.get("last_used"),
+                        legacy_item.get("last_used"),
+                    )
+                    existing_owners = set(target.get("source_owner_database_ids") or [])
+                    legacy_owners = set(
+                        legacy_item.get("source_owner_database_ids") or []
+                    )
+                    target["source_owner_database_ids"] = sorted(
+                        list(existing_owners | legacy_owners)
+                    )
+                else:
+                    promoted = dict(legacy_item)
+                    promoted["source_repo_database_id"] = resolved_db_id
+                    if (
+                        "source_owner_database_ids" not in promoted
+                        or promoted["source_owner_database_ids"] is None
+                    ):
+                        promoted["source_owner_database_ids"] = []
+                    else:
+                        promoted["source_owner_database_ids"] = sorted(
+                            list(set(promoted["source_owner_database_ids"]))
+                        )
+                    coalesced_immutable[key] = promoted
+            else:
+                fullname = legacy_item["source_repo_fullname"]
+                leg_key = (fullname, role_arn)
+                if leg_key in remaining_legacy_by_key:
+                    target_leg = remaining_legacy_by_key[leg_key]
+                    target_leg["times_used"] += legacy_item.get("times_used", 1)
+                    target_leg["first_seen_in_time_window"] = _earliest_timestamp(
+                        target_leg.get("first_seen_in_time_window"),
+                        legacy_item.get("first_seen_in_time_window"),
+                    )
+                    target_leg["last_used"] = _latest_timestamp(
+                        target_leg.get("last_used"),
+                        legacy_item.get("last_used"),
+                    )
+                else:
+                    remaining_legacy_by_key[leg_key] = dict(legacy_item)
+
+    final_immutable_assumptions = list(coalesced_immutable.values())
+    final_legacy_assumptions = list(remaining_legacy_by_key.values())
+
+    if final_immutable_assumptions:
+        matchlink_schema = GitHubRepoImmutableAssumeRoleWithWebIdentityMatchLink()
+        load_matchlinks(
+            neo4j_session,
+            matchlink_schema,
+            final_immutable_assumptions,
+            lastupdated=aws_update_tag,
+            _sub_resource_label="AWSAccount",
+            _sub_resource_id=current_aws_account_id,
+        )
+
+    if final_legacy_assumptions:
+        legacy_matchlink_schema = GitHubRepoAssumeRoleWithWebIdentityMatchLink()
+        load_matchlinks(
+            neo4j_session,
+            legacy_matchlink_schema,
+            final_legacy_assumptions,
+            lastupdated=aws_update_tag,
+            _sub_resource_label="AWSAccount",
+            _sub_resource_id=current_aws_account_id,
+        )
 
 
 def _convert_assumed_role_arn_to_role_arn(assumed_role_arn: str) -> str:
@@ -629,57 +946,66 @@ def _convert_assumed_role_arn_to_role_arn(assumed_role_arn: str) -> str:
     return assumed_role_arn
 
 
-def _strip_github_subject_id(segment: str) -> str:
+def parse_github_oidc_subject(
+    user_name: str,
+) -> Optional[Tuple[str, Optional[int], Optional[int]]]:
     """
-    Strip the immutable "@{id}" suffix from an owner or repository name in a GitHub OIDC subject.
+    Parse a GitHub Actions OIDC subject claim from CloudTrail userName.
 
-    GitHub separates names from IDs with "@" because "@" cannot appear in GitHub owner or
-    repository names. Returns the segment unchanged when it has no suffix, and an empty string
-    when the suffix is not a numeric ID.
+    GitHub Actions OIDC subjects have two formats:
+    - Legacy: "repo:{organization}/{repository}:{context}"
+    - Immutable: "repo:{organization}@{organization_id}/{repository}@{repository_id}:{context}"
+
+    Returns:
+        (repo_fullname, repo_database_id, owner_database_id) where repo_database_id
+        and owner_database_id are ints for immutable subjects, or None for legacy subjects.
+        Returns None if user_name is malformed or invalid.
     """
-    name, separator, github_id = segment.partition("@")
-    if not separator:
-        return segment
-    if not github_id.isdigit():
-        return ""
-    return name
+    if not user_name:
+        return None
+
+    parts = user_name.split(":")
+    if len(parts) < 3 or parts[0] != "repo":
+        return None
+
+    repo_path = parts[1]
+    if repo_path.count("/") != 1:
+        return None
+
+    owner_segment, repo_segment = repo_path.split("/")
+    if not owner_segment or not repo_segment:
+        return None
+
+    has_owner_at = "@" in owner_segment
+    has_repo_at = "@" in repo_segment
+
+    if has_owner_at != has_repo_at:
+        return None
+
+    if has_repo_at:
+        owner_name, _, owner_id = owner_segment.partition("@")
+        repo_name, _, repo_id = repo_segment.partition("@")
+
+        if not owner_name or not owner_id or not owner_id.isdigit():
+            return None
+        if not repo_name or not repo_id or not repo_id.isdigit():
+            return None
+
+        return f"{owner_name}/{repo_name}", int(repo_id), int(owner_id)
+    else:
+        return f"{owner_segment}/{repo_segment}", None, None
 
 
 def _extract_github_repo_from_username(user_name: str) -> str:
     """
     Extract GitHub repository fullname from CloudTrail userName field.
 
-    GitHub Actions CloudTrail events have userName set to the OIDC subject claim, in either format:
-    - "repo:{organization}/{repository}:{context}"
-    - "repo:{organization}@{organization_id}/{repository}@{repository_id}:{context}" (immutable)
-
-    Both return "{organization}/{repository}", which matches GitHubRepository.fullname.
-    See https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims
+    Returns repository fullname "{organization}/{repository}", or empty string if malformed.
     """
-    if not user_name:
+    parsed = parse_github_oidc_subject(user_name)
+    if not parsed:
         return ""
-
-    parts = user_name.split(":")
-
-    # Need at least 3 parts: ["repo", "{organization}/{repository}", "{context}"]
-    if len(parts) < 3 or parts[0] != "repo":
-        return ""
-
-    # Extract "{organization}/{repository}", with or without immutable IDs
-    repo_path = parts[1]
-
-    # Validate it looks like "{organization}/{repository}" format
-    if repo_path.count("/") != 1:
-        return ""
-
-    # Ensure both organization and repo exist
-    owner_segment, repo_segment = repo_path.split("/")
-    owner = _strip_github_subject_id(owner_segment)
-    repo = _strip_github_subject_id(repo_segment)
-    if not owner or not repo:
-        return ""
-
-    return f"{owner}/{repo}"
+    return parsed[0]
 
 
 @timeit
