@@ -19,6 +19,11 @@ from cartography.models.ontology.labels import USER_ACCOUNT
 @dataclass(frozen=True)
 class GitHubRepositoryNodeProperties(CartographyNodeProperties):
     id: PropertyRef = PropertyRef("id", description="GitHub repository URL.")
+    database_id: PropertyRef = PropertyRef(
+        "database_id",
+        extra_index=True,
+        description="GitHub numeric database ID for the repository.",
+    )
     lastupdated: PropertyRef = PropertyRef("lastupdated", set_in_kwargs=True)
     createdat: PropertyRef = PropertyRef(
         "createdat", description="Timestamp when the repository was created."

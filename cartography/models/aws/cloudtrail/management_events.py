@@ -155,7 +155,8 @@ class AssumeRoleWithWebIdentityRelProperties(CartographyRelProperties):
 @dataclass(frozen=True)
 class GitHubRepoAssumeRoleWithWebIdentityMatchLink(CartographyRelSchema):
     """
-    MatchLink schema for ASSUMED_ROLE_WITH_WEB_IDENTITY relationships from GitHub Actions to AWS roles.
+    MatchLink schema for ASSUMED_ROLE_WITH_WEB_IDENTITY relationships from GitHub Actions to AWS roles
+    matching legacy fullnames.
     Creates relationships like: (GitHubRepository)-[:ASSUMED_ROLE_WITH_WEB_IDENTITY]->(AWSRole)
 
     This MatchLink provides granular visibility into which specific GitHub repositories are assuming
@@ -177,4 +178,43 @@ class GitHubRepoAssumeRoleWithWebIdentityMatchLink(CartographyRelSchema):
     rel_label: str = "ASSUMED_ROLE_WITH_WEB_IDENTITY"
     properties: AssumeRoleWithWebIdentityRelProperties = (
         AssumeRoleWithWebIdentityRelProperties()
+    )
+
+
+@dataclass(frozen=True)
+class GitHubRepoImmutableAssumeRoleWithWebIdentityRelProperties(
+    AssumeRoleWithWebIdentityRelProperties
+):
+    """
+    Properties for the ASSUMED_ROLE_WITH_WEB_IDENTITY relationship from immutable GitHub Actions OIDC subjects.
+    Includes provenance of observed GitHub owner database IDs.
+    """
+
+    owner_database_ids: PropertyRef = PropertyRef(
+        "source_owner_database_ids",
+        description="Deduplicated collection of GitHub owner database IDs observed assuming this role.",
+    )
+
+
+@dataclass(frozen=True)
+class GitHubRepoImmutableAssumeRoleWithWebIdentityMatchLink(CartographyRelSchema):
+    """
+    MatchLink schema for ASSUMED_ROLE_WITH_WEB_IDENTITY relationships from GitHub Actions
+    using immutable numeric repository IDs to AWS roles.
+    Creates relationships like: (GitHubRepository)-[:ASSUMED_ROLE_WITH_WEB_IDENTITY]->(AWSRole)
+    """
+
+    source_node_label: str = "GitHubRepository"
+    source_node_matcher: SourceNodeMatcher = make_source_node_matcher(
+        {"database_id": PropertyRef("source_repo_database_id")},
+    )
+
+    target_node_label: str = "AWSRole"
+    target_node_matcher: TargetNodeMatcher = make_target_node_matcher(
+        {"arn": PropertyRef("destination_principal_arn")},
+    )
+    direction: LinkDirection = LinkDirection.OUTWARD
+    rel_label: str = "ASSUMED_ROLE_WITH_WEB_IDENTITY"
+    properties: GitHubRepoImmutableAssumeRoleWithWebIdentityRelProperties = (
+        GitHubRepoImmutableAssumeRoleWithWebIdentityRelProperties()
     )

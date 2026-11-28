@@ -487,12 +487,15 @@ def test_cloudtrail_management_events_creates_assumed_role_with_web_identity_rel
             fullname: 'example-org/example-repo',
             name: 'example-repo',
             id: 'https://github.com/example-org/example-repo',
+            createdat: '2020-01-01T00:00:00Z',
             lastupdated: $update_tag
         }),
         (repo2:GitHubRepository {
             fullname: 'myorg/demo-app',
             name: 'demo-app',
             id: 'https://github.com/myorg/demo-app',
+            database_id: 456789,
+            createdat: '2020-01-01T00:00:00Z',
             lastupdated: $update_tag
         })
         """,
@@ -609,12 +612,14 @@ def test_cloudtrail_web_identity_events_aggregates_multiple_users_and_tracks_ind
     )
 
     # Create GitHubRepository node
+    # Repository creation time is required for legacy OIDC lifecycle validation
     neo4j_session.run(
         """
         CREATE (repo:GitHubRepository {
             fullname: 'myorg/test-repo',
             name: 'test-repo',
             id: 'https://github.com/myorg/test-repo',
+            createdat: '2024-01-01T00:00:00Z',
             lastupdated: $update_tag
         })
         """,
