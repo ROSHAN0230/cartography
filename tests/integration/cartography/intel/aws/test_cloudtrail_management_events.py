@@ -612,12 +612,14 @@ def test_cloudtrail_web_identity_events_aggregates_multiple_users_and_tracks_ind
     )
 
     # Create GitHubRepository node
+    # Repository creation time is required for legacy OIDC lifecycle validation
     neo4j_session.run(
         """
         CREATE (repo:GitHubRepository {
             fullname: 'myorg/test-repo',
             name: 'test-repo',
             id: 'https://github.com/myorg/test-repo',
+            createdat: '2024-01-01T00:00:00Z',
             lastupdated: $update_tag
         })
         """,
